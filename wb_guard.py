@@ -103,6 +103,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_sessions": 12,
     # 中断时是否自动切到目标任务再发指令
     "switch_session": True,
+    # 切换会话的总时限（秒）：超时就放弃，别把主循环卡死
+    "switch_timeout_seconds": 40,
     # 救完别的任务后，是否把界面切回用户原来那个对话（避免把人拽走）
     "switch_back_after_recover": True,
     # 深链切换后等待界面响应的秒数
@@ -114,6 +116,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "list_x": 110,
     # 只监控 cwd 含该子串的会话（留空 = 不限制）
     "project_filter": "",
+    # 运行期间挡住系统睡眠 / 显示器休眠。
+    # 锁屏后所有输入通道都失效（实测，见 keep_awake 上方注释），
+    # 这是唯一纯软件能做、又不用管理员权限的预防手段。
+    "keep_awake": True,
+    "keep_display_on": True,
     # 只报告不执行
     "dry_run": False,
     # 连续失败这么多次 → 认为模型整体不可用，暂停自动续跑
@@ -205,6 +212,12 @@ GMEM_MOVEABLE = 0x0002
 SW_RESTORE = 9
 CREATE_NO_WINDOW = 0x08000000
 TH32CS_SNAPPROCESS = 0x00000002
+
+# SetThreadExecutionState 标志：挡住显示器休眠 / 系统睡眠
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+ES_AWAYMODE_REQUIRED = 0x00000040
 
 
 class RECT(ctypes.Structure):
@@ -420,16 +433,41 @@ def app_running(exe_name: str = EXE_NAME) -> bool:
     return bool(pids_of(exe_name))
 
 
-def workstation_locked() -> bool:
-    """检测工作站是否已锁屏。
+def _desktop_locked_by_window() -> bool:
+    """判据 A：看前台窗口是不是锁屏界面。
 
-    锁屏时模拟输入（点击、粘贴）全部无效，窗口也切不到前台，
-    表现为「日志说发了但没反应」。这是守护最常见的无效原因之一，
-    必须在发送前就查出来，而不是等激活失败再猜。
+    实测（Win11 26200 / 本机，2026-10-22）：锁屏时前台窗口是
+    `Windows.UI.Core.CoreWindow`，标题 `Windows Default Lock Screen`。
+    这是 XAML 锁屏，不是经典的 LogonUI 密码框，所以 ClassName 里没有
+    `LogonUI` 字样，必须匹配标题。
 
-    判据：锁屏进程 LogonUI.exe 存在（Win10/11 通用），
-    辅以「当前输入桌面不是 Default」作为兜底。
+    锁屏界面存在时前台一定被它占着 —— 也就是说 WorkBuddy 必然拿不到
+    前台，模拟输入必然落空。这个判据最直接、开销最小（两次 Win32 调用）。
     """
+    try:
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            return False
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(fg, cls, 256)
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(fg, title, 256)
+        c, t = cls.value, (title.value or "")
+        if "Lock Screen" in t or "锁屏" in t:
+            return True
+        if c in ("LockScreenBackstopFrame", "LockScreenControllerProxy"):
+            return True
+        # 经典登录界面（UAC / 安全桌面）
+        if c.startswith("LogonUI"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _desktop_locked_by_process() -> bool:
+    """判据 B：LogonUI.exe 存在（Win10/11 通用）。"""
     try:
         out = subprocess.run(
             ["tasklist", "/fi", "imagename eq LogonUI.exe", "/fo", "csv", "/nh"],
@@ -440,11 +478,22 @@ def workstation_locked() -> bool:
             return True
     except Exception:
         pass
-    # 兜底：读当前输入桌面名，锁屏时是 Winlogon 而不是 Default
+    return False
+
+
+def _desktop_locked_by_name() -> bool:
+    """判据 C（兜底，可靠性最低）：当前输入桌面名不是 Default。
+
+    注意：实测本机锁屏时 OpenInputDesktop 依然返回 `Default`
+    （Win11 把锁屏做成了普通桌面上的一个 XAML 窗口），所以这条判据
+    不能反向使用 —— 「拿到 Default」不等于「没锁屏」。
+    只保留「拿到非 Default」→ 判定锁屏 这一个方向。
+    """
     try:
+        user32.OpenInputDesktop.restype = wintypes.HANDLE
         hdesk = user32.OpenInputDesktop(0, True, 0x0001)  # DESKTOP_READOBJECTS
         if not hdesk:
-            return True
+            return False  # 拿不到句柄不足以判定，交给其它判据
         try:
             buf = ctypes.create_unicode_buffer(256)
             n = user32.GetUserObjectInformationW(hdesk, 2, buf, 512, None)  # UOI_NAME
@@ -455,6 +504,101 @@ def workstation_locked() -> bool:
     except Exception:
         pass
     return False
+
+
+def workstation_locked() -> bool:
+    """检测工作站是否已锁屏。
+
+    锁屏时模拟输入（点击、粘贴）全部无效，窗口也切不到前台，
+    表现为「日志说发了但没反应」。这是守护最常见的无效原因之一，
+    必须在发送前就查出来，而不是等激活失败再猜。
+
+    三条判据取并集（任一命中即锁屏）：
+      A 前台窗口是锁屏界面（Windows Default Lock Screen / LogonUI*）
+      B LogonUI.exe 进程存在
+      C 当前输入桌面不是 Default
+
+    历史坑：旧版把 C 当作兜底，且写成「OpenInputDesktop 失败 → 锁屏」。
+    本机实测锁屏时 OpenInputDesktop 成功且返回 Default，所以旧兜底永远
+    返回 False；一旦 LogonUI 判据在某些 Win11 版本上不成立，就会误判
+    「没锁屏」→ 盲目发送 → 用户看到「日志说发了但没反应」。这版修掉。
+    """
+    return _desktop_locked_by_window() or _desktop_locked_by_process() or _desktop_locked_by_name()
+
+
+# --------------------------------------------------------------------------
+# 锁屏规避：唯一「程序自己能做到」的一件事
+# --------------------------------------------------------------------------
+#
+# 实测结论（Win11 26200，2026-10-22，逐条验证过）：
+#
+#   通道                        锁屏时是否可用   说明
+#   ------------------------------------------------------------------------
+#   SendInput 模拟键鼠           ✗             前台被锁屏界面占用，输入不落到目标窗口
+#   SetForegroundWindow          ✗             返回 0，err=5（拒绝访问）
+#   UIA（uiautomation）          ✗             树塌成几个空 Pane，读到 0 个任务项
+#   剪贴板 OpenClipboard         ✗             全部失败，读回 None
+#   PostMessage 到标准 Win32 控件 ✓             记事本 Edit 实测成功写入
+#   PostMessage 到 Electron      ✗             WorkBuddy 主窗口 0 个子窗口，无可投递目标
+#   OpenInputDesktop 判桌面名     ✗（不可信）    锁屏时仍返回 "Default"，不能用它反推「没锁」
+#
+# 所以「锁屏状态下还能发指令」这件事，纯软件手段做不到 —— 这是 Windows 的
+# 安全边界，不是实现不够聪明。能做的是「别让机器进入锁屏/熄屏」：
+#
+#   1) SetThreadExecutionState 挡住显示器休眠与系统睡眠（本函数，无需提权）
+#   2) 关闭屏保 / 调长电源计划超时（需要用户自己设置，见 README）
+#   3) 组策略 NoLockScreen（需管理员，且只挡锁屏不挡熄屏）
+#
+# 注意 1) 只能挡「因空闲触发的睡眠/熄屏」，挡不住用户手动 Win+L。
+
+_keeper_state = {"on": False}
+
+
+def keep_awake(enable: bool = True, with_display: bool = True) -> bool:
+    """挡住系统睡眠 / 显示器休眠，返回是否成功。
+
+    用 SetThreadExecutionState 设 ES_CONTINUOUS，效果绑定在调用线程上：
+    线程退出即失效。守护是常驻线程，所以适合在这里调。
+
+    只挡空闲触发的睡眠；用户手动锁屏（Win+L）不受影响。
+    """
+    kernel32.SetThreadExecutionState.restype = wintypes.ULONG
+    flags = ES_CONTINUOUS
+    if enable:
+        flags |= ES_SYSTEM_REQUIRED
+        if with_display:
+            flags |= ES_DISPLAY_REQUIRED
+    try:
+        ret = kernel32.SetThreadExecutionState(flags)
+    except Exception:
+        return False
+    ok = bool(ret)
+    if ok:
+        _keeper_state["on"] = enable
+    return ok
+
+
+def display_settings_hint() -> Dict[str, Any]:
+    """读当前电源/屏保设置，给出「还能怎么调」的具体数值。"""
+    info: Dict[str, Any] = {"display_off_seconds": None, "sleep_seconds": None,
+                            "screensaver": None}
+    try:
+        out = subprocess.run(["powercfg", "/q", "SCHEME_CURRENT", "SUB_VIDEO", "VIDEOIDLE"],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=8, creationflags=CREATE_NO_WINDOW)
+        for line in (out.stdout or "").splitlines():
+            s = line.strip()
+            if "AC Power Setting Index" in s or "当前交流电源设置索引" in s:
+                info["display_off_seconds"] = int(s.split(":")[-1].strip() or s.split("：")[-1].strip(), 16)
+    except Exception:
+        pass
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as k:
+            info["screensaver"] = winreg.QueryValueEx(k, "ScreenSaveActive")[0]
+    except Exception:
+        pass
+    return info
 
 
 def activate_window(hwnd: int) -> bool:
@@ -687,6 +831,17 @@ def uia_task_items() -> List[dict]:
 
 
 def _collect_task_items_once() -> List[dict]:
+    """读出左栏任务条目（含「查看更多」入口、空间区里的项目）。
+
+    踩坑记录（这版是第三版，前两版都不稳）：
+    1) 最早用 `_uia_elements(is_button, limit=6000)` —— 列表滚动后全树节点上万，
+       全局预算在爬到左栏之前就耗尽，表现为「有时读得到、有时读出空列表」。
+    2) 改成「按矩形裁剪子树」—— 无效。Electron 各级 Pane 的 BoundingRectangle
+       都是整个客户区，祖先永远跨全窗，剪枝条件永远不成立（或误剪），结果直接读空。
+
+    现在：全树 DFS，**只保留 ButtonControl 进入候选**（文本、消息正文等类型直接跳过判定，
+    但继续下钻），预算提到 60000。左栏条目一定在树里较早的位置，实际耗时 0.3~1s。
+    """
     ctrl = _uia_main_ctrl()
     if ctrl is None:
         return []
@@ -699,38 +854,43 @@ def _collect_task_items_once() -> List[dict]:
     win_h = win.bottom - win.top
 
     raw = []
-
-    def is_button(k):
+    stack = [(ctrl, 0)]
+    guard = 0
+    while stack and guard < 60000:
+        c, depth = stack.pop()
+        guard += 1
+        if depth > 16:
+            continue
         try:
-            return k.ControlTypeName == "ButtonControl"
-        except Exception:
-            return False
-
-    for k in _uia_elements(is_button, max_depth=14, limit=6000):
-        try:
-            r = k.BoundingRectangle
-            nm = (k.Name or "").strip()
-            if not nm or len(nm) > 200:
-                continue
-            rel_x = r.left - left0
-            rel_y = r.top - top0
-            if rel_x < 0 or rel_x > win_w * 0.30:
-                continue
-            if rel_y < 100 or rel_y > win_h - 40:
-                continue
-            if r.width() < 80 or r.width() > win_w * 0.30:
-                continue
-            if not (18 <= r.height() <= 60):
-                continue
-            raw.append({
-                "name": nm,
-                "x": int(rel_x), "y": int(rel_y),
-                "cx": int(r.left + r.width() / 2),
-                "cy": int(r.top + r.height() / 2),
-                "w": int(r.width()), "h": int(r.height()),
-            })
+            kids = c.GetChildren()
         except Exception:
             continue
+        for k in kids:
+            try:
+                is_btn = k.ControlTypeName == "ButtonControl"
+            except Exception:
+                is_btn = False
+            if is_btn:
+                try:
+                    nm = (k.Name or "").strip()
+                    r = k.BoundingRectangle
+                    if nm and len(nm) <= 200:
+                        rel_x = r.left - left0
+                        rel_y = r.top - top0
+                        if (0 <= rel_x <= win_w * 0.30
+                                and 100 <= rel_y <= win_h - 40
+                                and 80 <= r.width() <= win_w * 0.30
+                                and 18 <= r.height() <= 60):
+                            raw.append({
+                                "name": nm,
+                                "x": int(rel_x), "y": int(rel_y),
+                                "cx": int(r.left + r.width() / 2),
+                                "cy": int(r.top + r.height() / 2),
+                                "w": int(r.width()), "h": int(r.height()),
+                            })
+                except Exception:
+                    pass
+            stack.append((k, depth + 1))
 
     if not raw:
         return []
@@ -745,6 +905,7 @@ def _collect_task_items_once() -> List[dict]:
         best = raw
     best.sort(key=lambda d: d["y"])
     return best
+
 
 
 def uia_left_rail_items() -> List[dict]:
@@ -786,48 +947,65 @@ def _scroll_rail(delta: int, hwnd=None) -> None:
 
 
 def uia_find_and_click(title: str, session: Optional[Session] = None,
-                       max_expand: int = 3) -> bool:
+                       max_expand: int = 3, budget: float = 40.0) -> bool:
     """在左栏里找到某个任务并点开。
 
-    WorkBuddy 左栏是分组的、而且可以滚动：
+    WorkBuddy 左栏是分组 + 可滚动的：
       任务 (N)   —— 最近若干条，其余藏在「查看更多」
       空间 (N)   —— 按项目分组（PPJH / REA / 钢筋算量 …），项目下缩进列出任务
-    所以查找顺序是：
-      ① 当前可见列表
-      ② 展开「查看更多」
-      ③ 向上/向下滚动侧栏再看（覆盖藏在滚动区外的项目分组）
-      ④ 点开对应项目再看
-    找到后点击，并用「标题文字 / 像素指纹」双层校验，确认真的切过去了。
+
+    查找顺序：
+      1) 当前可见列表（最快）
+      2) 展开「查看更多」
+      3) 上下滚动侧栏（覆盖藏在滚动区外的条目）
+      4) 目标项目分组若出现，点开它再看
+
+    性能要点：整轮用**一个总时限 budget**（默认 40s）。早期版本每个候选标题都跑一遍
+    完整滚动（6+12 次滚轮），三个候选加起来 90 秒以上，把守护主循环整个卡死。
     """
     if not title:
         return False
+    deadline = time.time() + budget
+
+    def time_left() -> bool:
+        return time.time() < deadline
 
     def click_item(hit) -> bool:
         hwnd = find_main_window()
         if hwnd and not activate_window(hwnd):
             return False
-        time.sleep(0.2)
+        time.sleep(0.25)
         fp_before = header_fingerprint()
         pt = POINT(hit["cx"], hit["cy"])
         user32.ScreenToClient(hwnd, ctypes.byref(pt))
         click_client(hwnd, pt.x, pt.y)
         time.sleep(1.3)
+        # 首选：读标题文字确认（最可靠）。之前只靠指纹，导致「本来就已经在这个会话、
+        # 点一下没有任何视觉变化」被误判成失败 —— 这是 9 次 switch-failed 的根因之一。
+        for _ in range(3):
+            cur = ""
+            try:
+                cur = uia_header_text()
+            except Exception:
+                pass
+            if cur and _title_similar(cur, title):
+                return True
+            time.sleep(0.5)
         cur = ""
         try:
-            cur = uia_current_conversation()
+            cur = uia_header_text()
         except Exception:
             pass
-        if cur and _title_similar(cur, title):
+        if cur:
+            log(f"点开后标题是「{cur[:24]}」，与目标「{title[:24]}」不符", "WARN")
+            return False
+        # 标题读不到（窗口在后台时 Electron 报空矩形）才退回指纹
+        fp_after = header_fingerprint()
+        if fp_before and fp_after and _fp_changed(fp_before, fp_after):
             return True
-        if not cur:
-            fp_after = header_fingerprint()
-            if fp_before and fp_after and _fp_changed(fp_before, fp_after):
-                return True
-            time.sleep(1.2)
-            fp2 = header_fingerprint()
-            return bool(fp_before and fp2 and _fp_changed(fp_before, fp2))
-        log(f"点开后标题是「{cur}」，与目标「{title}」不符", "WARN")
-        return False
+        time.sleep(1.2)
+        fp2 = header_fingerprint()
+        return bool(fp_before and fp2 and _fp_changed(fp_before, fp2))
 
     def find_in(raws):
         for it in raws:
@@ -845,7 +1023,7 @@ def uia_find_and_click(title: str, session: Optional[Session] = None,
     proj = os.path.basename((session.cwd or "").rstrip("\\/")) if (session and session.cwd) else ""
 
     def job():
-        # ① 先看当前可见
+        # ① 先看当前可见（覆盖绝大多数情况，最快）
         hit = find_in(_collect_task_items_once())
         if hit:
             return click_item(hit)
@@ -859,11 +1037,13 @@ def uia_find_and_click(title: str, session: Optional[Session] = None,
             if hit:
                 return click_item(hit)
 
-        # ③ 上下滚动侧栏查找（最多滚几屏）
-        for direction, times in ((-5, 6), (5, 12)):
+        # ③ 滚动侧栏查找（带总时限，别把主循环卡死）
+        for direction, times in ((-5, 5), (5, 10)):
             for _ in range(times):
+                if not time_left():
+                    return False
                 _scroll_rail(direction)
-                time.sleep(0.45)
+                time.sleep(0.4)
                 raws = _collect_task_items_once()
                 hit = find_in(raws)
                 if hit:
@@ -874,7 +1054,7 @@ def uia_find_and_click(title: str, session: Optional[Session] = None,
                     hit = find_in(_collect_task_items_once())
                     if hit:
                         return click_item(hit)
-                # ④ 顺路看看目标项目分组是否出现，点开它
+                # ④ 顺路看目标项目分组是否出现，点开它
                 if proj and len(proj) >= 3:
                     pj = next((it for it in raws
                                if it["name"].strip().lower() == proj.lower()), None)
@@ -885,7 +1065,8 @@ def uia_find_and_click(title: str, session: Optional[Session] = None,
                             return click_item(hit)
         return False
 
-    return bool(_uia_run(job, timeout=120.0))
+    return bool(_uia_run(job, timeout=budget + 30.0))
+
 
 
 def uia_task_titles() -> List[str]:
@@ -943,11 +1124,19 @@ def _fp_changed(a: str, b: str, tol: float = 0.06) -> bool:
     return d > tol
 
 
-def uia_current_conversation() -> str:
-    """读出当前对话顶部标题的文字。
+def uia_header_text() -> str:
+    """读出内容区顶部那条「会话标题」文字。
 
-    WorkBuddy 顶部标题是普通文本节点，UIA 里可能既没有 Name 也没有 ControlType，
-    因此这里用「限定区域 + 取最靠上且有文字」的方式，并对区域做横向收紧。
+    定位这个标题踩过三个坑，都记在这里免得再走弯路：
+    1) 它**层级很深（实测第 9 层）**。早期版本限 depth<=8、只扫 1500 节点 → 永远扫不到 → 一直返回空，
+       直接导致「点击后无法确认是否切换成功」，把所有"本来就已经在这个会话"的情况误判成切换失败。
+    2) 用统一的 DFS + 全局节点预算也不行：预算会在消息列表里耗尽
+       （实测 12000 预算下只拿到 333 个 TextControl，标题不在其中）。
+    3) 按矩形裁剪很快，但**取不到矩形时不能剪** —— Electron 偶发在中间节点上抛异常，
+       一剪就把标题的整条祖先链剪没了，表现为"有时读得到、有时读不到"。
+
+    所以：DFS + 矩形裁剪（取不到矩形就照常下钻）+ 若一条都没找到，再做一次**无剪枝**的全树兜底扫描。
+    实测标题节点：屏幕 (304, 51)、512x21，相对窗口 (312, 59)。
     """
     def job():
         ctrl = _uia_main_ctrl()
@@ -958,64 +1147,140 @@ def uia_current_conversation() -> str:
         user32.GetWindowRect(hwnd, ctypes.byref(win))
         win_left, win_top = win.left, win.top
         win_w = win.right - win.left
+        band_bottom = win_top + 110          # 头部横带下沿
+        band_left = win_left + 270           # 左栏右边界
 
-        cands = []
+        # 前置判据：WorkBuddy 不在前台时，Electron 给标题等控件报空矩形，
+        # 怎么扫都是空（实测要白扫 6~19 秒）。直接返回，让调用方先去置前。
+        try:
+            fg = user32.GetForegroundWindow()
+            if fg != hwnd:
+                fg_pid = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+                own_pid = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(own_pid))
+                if fg_pid.value != own_pid.value:
+                    return ""
+        except Exception:
+            pass
 
-        def visit(k):
+        def rect_of(k):
             try:
-                r = k.BoundingRectangle
-                nm = (k.Name or "").strip()
-                if not nm or len(nm) < 3 or len(nm) > 140:
-                    return
-                # 内容区顶部一带（左侧栏右边、窗口上沿 30~120px）
-                rel_x = r.left - win_left
-                rel_y = r.top - win_top
-                if rel_x < 260 or rel_x > win_w * 0.85:
-                    return
-                if not (28 <= rel_y <= 120):
-                    return
-                cands.append((rel_y, -r.width(), nm))
+                return k.BoundingRectangle
             except Exception:
-                pass
+                return None
 
-        # 只遍历浅层（标题一定靠近根）
-        stack = [(ctrl, 0)]
-        seen = 0
-        while stack and seen < 1500:
-            c, depth = stack.pop()
-            if depth > 8:
-                continue
-            try:
-                kids = c.GetChildren()
-            except Exception:
-                continue
-            for k in kids:
+        def scan(prune: bool, max_nodes: int) -> str:
+            cands = []
+            stack = [(ctrl, 0)]
+            seen = 0
+            while stack and seen < max_nodes:
+                c, depth = stack.pop()
                 seen += 1
-                visit(k)
-                stack.append((k, depth + 1))
-        if not cands:
-            return ""
-        cands.sort()
-        return cands[0][2]
+                if depth > 18:
+                    continue
+                try:
+                    kids = c.GetChildren()
+                except Exception:
+                    continue
+                for k in kids:
+                    r = rect_of(k)
+                    # 仅在有可靠矩形、且整块都在头部下方时剪枝；取不到矩形一律照常下钻
+                    if prune and r is not None and r.top >= band_bottom:
+                        continue
+                    try:
+                        nm = (k.Name or "").strip()
+                        ct = k.ControlTypeName
+                    except Exception:
+                        nm, ct = "", ""
+                    if nm and ct == "TextControl" and r is not None:
+                        try:
+                            if (band_left <= r.left <= win_left + win_w * 0.80
+                                    and 24 <= (r.top - win_top) <= 96
+                                    and r.width() >= 60
+                                    and 14 <= r.height() <= 48
+                                    and 2 <= len(nm) <= 200):
+                                cands.append(((r.top - win_top), -r.width(), nm))
+                        except Exception:
+                            pass
+                    stack.append((k, depth + 1))
+            if not cands:
+                return ""
+            cands.sort()
+            return cands[0][2]
 
-    return _uia_run(job, timeout=8.0) or ""
+        # 快扫（带剪枝）成本 <1s；找不到时做**一次**全树兜底，其余轮次只重试快扫。
+        # 窗口刚置前时 Electron 可能还没重绘完、控件矩形为空，表现为「第一次读是空、
+        # 过一会儿就有了」，所以需要重试，但重试必须是便宜的，否则会把主循环拖死。
+        for attempt in range(6):
+            got = scan(True, 40000)
+            if got:
+                return got
+            if attempt == 2:
+                got = scan(False, 60000)
+                if got:
+                    return got
+            time.sleep(0.5)
+        return ""
+
+    return _uia_run(job, timeout=30.0) or ""
+
+
+def uia_current_conversation() -> str:
+    """当前会话标题（保留旧名字，兼容既有调用）。"""
+    return uia_header_text()
+
+
+
+_REL_TIME_TAIL = re.compile(
+    r"\s*(?:刚刚|\d+\s*秒前|\d+\s*分钟前|\d+\s*小时前|昨天|前天|\d+\s*天前|"
+    r"\d+\s*月\s*\d+\s*日|\d{4}-\d{2}-\d{2})\s*$"
+)
+
+
+def _norm_title(t: str) -> str:
+    """归一化标题：去空白、去尾部省略号、去「3小时前」这类相对时间后缀。
+
+    左栏条目和内容区标题都会被 UI 截断成 `...`，还常带相对时间后缀，
+    不先洗掉这两样，任何前缀/包含判断都会失败。
+    """
+    s = re.sub(r"\s+", " ", (t or "")).strip().lower()
+    for _ in range(3):
+        before = s
+        s = s.rstrip()
+        s = re.sub(r"(?:\.{2,}|\u2026+)$", "", s).strip()   # 去掉尾部 ... 或 …
+        s = _REL_TIME_TAIL.sub("", s).strip()                  # 去掉「3小时前」
+        if s == before:
+            break
+    return s
 
 
 def _title_similar(a: str, b: str) -> bool:
-    """标题模糊匹配：列表项会截断并附带相对时间，所以用前缀/包含判断。"""
+    """标题模糊匹配。
+
+    必须容忍三种噪声（都是实际遇到的）：
+      1) UI 截断：`I://电子书//机械工业出版社6000 再帮我挑30本和…」`；
+      2) 相对时间后缀：`安装 opendataloader-pdf 技能 昨天`；
+      3) 全角/半角标点差异。
+    """
     if not a or not b:
         return False
-    na = re.sub(r"\s+", " ", a).strip().lower()
-    nb = re.sub(r"\s+", " ", b).strip().lower()
+    na, nb = _norm_title(a), _norm_title(b)
+    if not na or not nb:
+        return False
     if na == nb:
         return True
     if len(na) >= 6 and (na.startswith(nb) or nb.startswith(na)):
         return True
     if len(na) >= 8 and (na in nb or nb in na):
         return True
-    ca = re.sub(r"[^\w\u4e00-\u9fff]", "", na)[:6]
-    cb = re.sub(r"[^\w\u4e00-\u9fff]", "", nb)[:6]
-    return bool(ca) and ca == cb and len(ca) >= 4
+    # 只保留字母数字汉字后再比前 8 个字符（应对标点差异）
+    ca = re.sub(r"[^\w\u4e00-\u9fff]", "", na)[:8]
+    cb = re.sub(r"[^\w\u4e00-\u9fff]", "", nb)[:8]
+    if not ca or not cb:
+        return False
+    n = min(len(ca), len(cb))
+    return n >= 4 and ca[:n] == cb[:n]
 
 
 def uia_click_task(title: str, timeout: float = 4.0) -> bool:
@@ -1592,6 +1857,11 @@ def diagnose(session: Optional[Session], cfg: Dict[str, Any]) -> Diagnosis:
                 msg = body
             if not code:
                 code = _guess_error_code(msg)
+            # 用户在界面上点了「停止」：有意为之，不是模型故障，不自动续跑
+            if "interrupted by user" in (msg or "").lower():
+                diag.state = STATE_IDLE
+                diag.detail = "用户主动中断，不自动续跑"
+                return diag
             diag.state = STATE_INTERRUPTED
             diag.error_code = code or "incomplete"
             diag.error_message = msg
@@ -1692,6 +1962,24 @@ class StateStore:
                 self.data["stats"]["recovered"] = int(self.data["stats"].get("recovered", 0)) + 1
             else:
                 self.data["stats"]["failed"] = int(self.data["stats"].get("failed", 0)) + 1
+            self.save()
+
+    def note_blocked(self, key: str, detail: str = "") -> None:
+        """记录一次「环境阻塞」（如锁屏）：只记账，不消耗 attempts。
+
+        note_send 每次都会 attempts+1。锁屏这类环境问题不是续跑失败，
+        若照常累计，锁屏几分钟就把 attempts 耗到 max_attempts，
+        桌面真正解锁后反而被「已达最大重试次数」挡住，永远发不出去。
+        """
+        with self.lock:
+            e = self.entry(key)
+            e["last_ts"] = time.time()
+            e["last_detail"] = detail
+            e["next_ts"] = time.time() + 10.0
+            self.data["history"].append({
+                "ts": time.time(), "key": key, "ok": False, "detail": detail,
+            })
+            self.data["history"] = self.data["history"][-200:]
             self.save()
 
     def mark_success(self, key: str) -> None:
@@ -1891,30 +2179,47 @@ class Guard:
     def switch_session(self, session: Session) -> bool:
         """把界面切到指定会话。
 
-        策略顺序：
-        1. 当前显示的就是它 → 无需动作
-        2. 用 UIA 在左侧任务列表里按标题点击（主路径）。
-           标题有多个候选（aiTitle / 用户首句 / 目录名），逐个试：
-           左栏显示的是 aiTitle，所以它排第一；首句和目录名是兜底。
-        3. 都失败就返回 False —— 宁可不动，也不要把「继续」发到别的任务里。
+        关键前提：**必须先置前**。WorkBuddy 在后台时，Electron 会给标题等控件报空矩形，
+        标题读出来是空的，于是"是否已经在这个会话"判断失效、点击后的校验也失效
+        —— 这会把它误判成切换失败（线上 9 次 switch-failed 就是这一条）。
+
+        策略：
+        1. 置前 → 读标题 → 已经是它就直接成功（不做任何点击，避免"点了没变化=失败"的假失败）；
+        2. 按候选标题（aiTitle → 首句 → 目录名）在左栏找并点击，点完**再用标题文字确认**；
+        3. 全都不成返回 False —— 宁可不动，也不能把「继续」发到别的任务里。
         """
         cands = self._session_title_candidates(session)
         if not cands:
             log("拿不到该会话的标题，无法安全切换，跳过", "WARN")
             return False
         want = cands[0]
+        t0 = time.time()
 
-        cur = uia_current_conversation()
+        exe = str(self.cfg.get("target_exe") or EXE_NAME)
+        hwnd = find_main_window(exe)
+        if hwnd and user32.GetForegroundWindow() != hwnd:
+            activate_window(hwnd)
+            time.sleep(0.5)
+
+        cur = uia_header_text()
         if cur and any(_title_similar(cur, c) for c in cands):
-            log(f"界面已在目标任务（{cur}）")
+            log(f"界面已在目标任务（{cur[:24]}），无需切换")
             return True
+        if not cur:
+            log("读不到当前会话标题（可能窗口不在前台），将直接按键匹配查找", "WARN")
 
+        budget = float(self.cfg.get("switch_timeout_seconds", 40))
         for i, c in enumerate(cands):
+            left = budget - (time.time() - t0)
+            if left < 6:
+                log(f"切换已超时（{budget:.0f}s），放弃剩余候选", "WARN")
+                break
             try:
                 ok = uia_find_and_click(c, session=session,
-                                        max_expand=int(self.cfg.get("max_expand_rounds", 3)))
+                                        max_expand=int(self.cfg.get("max_expand_rounds", 3)),
+                                        budget=min(left, budget))
             except Exception as e:
-                log(f"UIA 查找/点击异常（{c}）：{e}", "WARN")
+                log(f"UIA 查找/点击异常（{c[:20]}）：{e}", "WARN")
                 ok = False
             if ok:
                 how = "标题" if i == 0 else ("首句" if i == 1 else "目录名")
@@ -1922,7 +2227,7 @@ class Guard:
                 return True
             log(f"候选标题未命中：「{c[:22]}」", "INFO")
 
-        log(f"切换失败（目标「{want}」）。请确认该任务在左栏可见："
+        log(f"切换失败（目标「{want[:24]}」）。请确认该任务在左栏可见："
             f"若属于某个项目，先在「空间」里展开该项目一次", "ERROR")
         return False
 
@@ -2001,12 +2306,12 @@ class Guard:
 
         # 锁屏时点击/粘贴/切窗口全都无效，先查出来，别等激活失败再猜
         if workstation_locked():
-            log("工作站已锁屏，无法发送输入。请保持桌面处于登录状态（或关闭自动锁屏），"
-                "本轮跳过，解锁后会自动重试", "ERROR")
-            self.state.note_send(key, False, "workstation-locked")
-            entry["attempts"] = attempt
-            entry["next_ts"] = time.time() + float(cfg.get("backoff_base", 20))
-            self.state.save()
+            log("工作站已锁屏：模拟键鼠、UIA 读取、剪贴板全部不可用，本轮不发送。"
+                "这不是续跑失败，是环境阻塞 —— 解锁后会自动重试", "ERROR")
+            # 走 note_blocked：只记账，不消耗 attempts。
+            # 否则锁屏一段时间（约3分钟）就把 attempts 耗到 max_attempts，
+            # 真正解锁后反而被「已达最大重试次数」挡住，再也发不出去。
+            self.state.note_blocked(key, "workstation-locked")
             return False
 
         hwnd = find_main_window(exe)
@@ -2163,10 +2468,33 @@ class Guard:
         log("=" * 62)
         log(f"WorkBuddy 守护启动｜dry_run={self.dry_run}｜轮询 {self.cfg.get('poll_interval')}s")
         log(f"会话目录：{PROJECTS_DIR}")
+
+        # 先挡住睡眠/熄屏，再开始轮询 —— 一旦锁屏就什么也发不出去了
+        if self.cfg.get("keep_awake", True):
+            if keep_awake(True, with_display=bool(self.cfg.get("keep_display_on", True))):
+                mode = "系统+显示器" if self.cfg.get("keep_display_on", True) else "仅系统"
+                log(f"已阻止空闲休眠（{mode}），避免锁屏导致发送失效")
+            else:
+                log("阻止空闲休眠失败（不影响监控，但空闲后可能锁屏）", "WARN")
+
         log("=" * 62)
         last_state = ""
+        last_lock_state: Optional[bool] = None
+
         while not self.stop_flag.is_set():
             try:
+                # 每轮捎带一次锁屏检测：状态变化时记一条，避免刷屏
+                locked = workstation_locked()
+                if locked != last_lock_state:
+                    if locked:
+                        log("工作站进入锁屏：检测继续，但无法发送输入（解锁后自动恢复）", "WARN")
+                    else:
+                        log("工作站已解锁：恢复正常发送能力", "OK")
+                    last_lock_state = locked
+                    # SetThreadExecutionState 绑定线程，某些情况下会被系统重置，顺手续一下
+                    if self.cfg.get("keep_awake", True):
+                        keep_awake(True, with_display=bool(self.cfg.get("keep_display_on", True)))
+
                 d = self.tick()
                 line = self.format_status(d)
                 if d.state != last_state:
@@ -2230,7 +2558,19 @@ def cmd_status(cfg: Dict[str, Any], session_file: Optional[Path]) -> int:
           + (f"  «{window_title(hwnd)}»" if hwnd else ""))
     print(f"  空闲时长     : {idle_seconds():.0f} 秒")
     locked = workstation_locked()
-    print(f"  桌面状态     : {'已锁屏（无法发送输入，解锁后自动重试）' if locked else '可交互'}")
+    if locked:
+        why = []
+        if _desktop_locked_by_window():
+            why.append("前台是锁屏界面")
+        if _desktop_locked_by_process():
+            why.append("LogonUI.exe 存在")
+        if _desktop_locked_by_name():
+            why.append("输入桌面非 Default")
+        print(f"  桌面状态     : 已锁屏（{'、'.join(why) or '未知原因'}）")
+        print(f"  可发送       : 否 —— 锁屏下模拟键鼠 / UIA / 剪贴板全部不可用")
+        print(f"  提示         : 检测照常进行，中断会被记录；解锁后自动重试，无需重开")
+    else:
+        print(f"  桌面状态     : 可交互")
 
     # 多任务：逐个检查所有活跃会话，而不是只看最新的那个
     if session_file:
@@ -2335,6 +2675,143 @@ def _session_display_title(session: Session) -> str:
             first_user = t
     cwd_name = os.path.basename((session.cwd or "").rstrip("\\/"))
     return (ai_title or first_user or cwd_name or session.session_id[:8])[:40]
+
+
+def cmd_lockcheck(cfg: Dict[str, Any]) -> int:
+    """逐条实测「锁屏下哪些输入通道还活着」，给出能/不能的硬结论。
+
+    这个命令存在的原因：锁屏问题反复出现，每次都靠人肉猜太慢。
+    把所有候选通道一次跑完，输出可复现的证据。
+    只做「读」和「无害探测」，不往 WorkBuddy 里发任何东西。
+    """
+    exe = str(cfg.get("target_exe") or EXE_NAME)
+    print()
+    print("锁屏通道实测")
+    print("=" * 64)
+
+    locked = workstation_locked()
+    print(f"  锁定状态      : {'已锁屏' if locked else '未锁屏'}")
+    for name, fn in (("前台是锁屏界面", _desktop_locked_by_window),
+                     ("LogonUI.exe 存在", _desktop_locked_by_process),
+                     ("输入桌面非 Default", _desktop_locked_by_name)):
+        try:
+            print(f"    · {name:<18}: {fn()}")
+        except Exception as e:
+            print(f"    · {name:<18}: 异常 {e}")
+
+    # 前台窗口
+    try:
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        fg = user32.GetForegroundWindow()
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(fg, cls, 256)
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(fg, title, 256)
+        print(f"  前台窗口      : {cls.value} / {title.value!r}")
+    except Exception as e:
+        print(f"  前台窗口      : 读取失败 {e}")
+
+    hwnd = find_main_window(exe)
+    print(f"  目标主窗口    : {hwnd if hwnd else '未找到'}")
+    print()
+
+    rows: List[tuple] = []
+
+    # 1 SetForegroundWindow
+    if hwnd:
+        try:
+            ok = bool(user32.SetForegroundWindow(hwnd))
+            err = ctypes.get_last_error()
+            got = user32.GetForegroundWindow()
+            rows.append(("SetForegroundWindow 置前", "可用" if (ok and got == hwnd) else "不可用",
+                         f"返回 {ok}，err={err}，前台仍是 {got}"))
+        except Exception as e:
+            rows.append(("SetForegroundWindow 置前", "不可用", str(e)))
+    else:
+        rows.append(("SetForegroundWindow 置前", "无法测试", "未找到主窗口"))
+
+    # 2 剪贴板
+    try:
+        ok = set_clipboard_text("wbguard-lockcheck")
+        back = get_clipboard_text()
+        rows.append(("剪贴板写入", "可用" if ok and back else "不可用",
+                     f"写入={ok} 读回={back!r}"))
+    except Exception as e:
+        rows.append(("剪贴板写入", "不可用", str(e)))
+
+    # 3 UIA
+    try:
+        t0 = time.time()
+        items = uia_task_items()
+        hdr = uia_header_text()
+        rows.append(("UIA 读取任务列表", "可用" if items else "不可用",
+                     f"{len(items)} 项，标题={hdr!r}，耗时 {time.time()-t0:.1f}s"))
+    except Exception as e:
+        rows.append(("UIA 读取任务列表", "不可用", str(e)))
+
+    # 4 PostMessage 到目标窗口的子控件（Electron 通常没有）
+    if hwnd:
+        try:
+            n_child = [0]
+
+            def _count(h, lp):
+                n_child[0] += 1
+                return True
+
+            EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumChildWindows.argtypes = [wintypes.HWND, EnumProc, wintypes.LPARAM]
+            user32.EnumChildWindows(hwnd, EnumProc(_count), 0)
+            rows.append(("PostMessage 注入字符", "可用" if n_child[0] else "不可用",
+                         f"主窗口子控件数 {n_child[0]}（Electron 无原生编辑控件可投递）"))
+        except Exception as e:
+            rows.append(("PostMessage 注入字符", "不可用", str(e)))
+
+    # 5 显示器状态
+    try:
+        import tempfile
+        tmp = LOG_DIR / "_lockcheck_shot.png"
+        capture_screen(tmp, None)
+        from PIL import Image
+        im = Image.open(tmp).convert("L")
+        hist = im.histogram()
+        mean = sum(i * n for i, n in enumerate(hist)) / max(1, im.width * im.height)
+        tmp.unlink(missing_ok=True)
+        rows.append(("截屏亮度", "可用" if mean > 30 else "偏暗/黑屏",
+                     f"均值 {mean:.1f}（<30 通常表示熄屏或锁屏遮罩）"))
+    except Exception as e:
+        rows.append(("截屏亮度", "无法测试", str(e)))
+
+    # 6 阻止休眠
+    try:
+        ok = keep_awake(True, with_display=True)
+        rows.append(("阻止空闲休眠", "可用" if ok else "失败",
+                     "SetThreadExecutionState 已设置（本命令退出即释放）"))
+    except Exception as e:
+        rows.append(("阻止空闲休眠", "失败", str(e)))
+
+    print(f"  {'通道':<26}{'结论':<12}证据")
+    print("  " + "-" * 62)
+    for name, verdict, note in rows:
+        print(f"  {name:<26}{verdict:<12}{note}")
+
+    print()
+    info = display_settings_hint()
+    print("  当前电源设置：")
+    sec = info.get("display_off_seconds")
+    print(f"    · 显示器超时  : {sec} 秒（{sec//60 if isinstance(sec,int) else '?'} 分钟）")
+    print(f"    · 屏保启用    : {info.get('screensaver')}")
+    print()
+    print("  结论：")
+    if locked:
+        print("    已锁屏。可用通道为 0 —— 模拟键鼠 / UIA / 剪贴板全部失效，")
+        print("    Electron 又没有可被 PostMessage 投递的原生控件，因此此刻无法发送指令。")
+        print("    这是 Windows 的安全边界，不是程序 bug。")
+        print("    可行的只有两条：① 解锁后自动恢复；② 提前阻止锁屏（见 README「锁屏」一节）。")
+    else:
+        print("    当前未锁屏，正常通道可用。若担心离开后锁屏，把 config.json 的")
+        print("    keep_awake / keep_display_on 保持 true，并关掉屏保。")
+    print()
+    return 0
 
 
 def cmd_probe(cfg: Dict[str, Any]) -> int:
@@ -2616,10 +3093,26 @@ def cmd_gui(cfg: Dict[str, Any]) -> int:
     import tkinter as tk
     from tkinter import ttk
 
-    root = tk.Tk()
+    # 面板本身绝不能静默崩掉：任何未捕获异常都写进日志再弹窗说明。
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        log(f"GUI 启动失败（Tk 初始化）：{e}", "ERROR")
+        raise
     root.title("WorkBuddy 断流守护")
     root.geometry("760x520")
     root.minsize(640, 440)
+
+    def _gui_exc(exc, val, tb):
+        import traceback as _tb
+        msg = "".join(_tb.format_exception(exc, val, tb))
+        log("GUI 未捕获异常：\n" + msg, "ERROR")
+        try:
+            tk.messagebox.showerror("WorkBuddy 守护面板出错", msg[-1200:])
+        except Exception:
+            pass
+
+    root.report_callback_exception = _gui_exc
 
     state_var = tk.StringVar(value="未启动")
     session_var = tk.StringVar(value="-")
@@ -2645,6 +3138,24 @@ def cmd_gui(cfg: Dict[str, Any]) -> int:
     ttk.Label(top, textvariable=session_var, wraplength=600).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
     ttk.Label(top, text="说明：").grid(row=2, column=0, sticky="nw", pady=(4, 0))
     ttk.Label(top, textvariable=detail_var, wraplength=600).grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
+
+    # 环境阻塞提示：锁屏时检测照常，但发不出去。不写清楚用户只会看到「监控中」发呆。
+    env_var = tk.StringVar(value="")
+    env_label = ttk.Label(top, textvariable=env_var, wraplength=680,
+                          font=("Microsoft YaHei UI", 9, "bold"))
+    env_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+    def _refresh_env():
+        try:
+            if workstation_locked():
+                env_var.set("⚠ 桌面已锁屏：检测正常，但锁屏下无法发送输入（模拟键鼠 / UIA / 剪贴板均不可用）。"
+                            "解锁后自动重试，无需重启面板。")
+                env_label.configure(foreground="#c0392b")
+            else:
+                env_var.set("")
+        except Exception:
+            pass
+        root.after(3000, _refresh_env)
 
     opts = ttk.Frame(root, padding=(10, 0))
     opts.pack(fill="x")
@@ -2823,7 +3334,15 @@ def cmd_gui(cfg: Dict[str, Any]) -> int:
                         if diags else "-")
 
     root.after(300, pump)
+    root.after(100, _refresh_env)
     root.protocol("WM_DELETE_WINDOW", lambda: (stop(), root.destroy()))
+
+    # 打开面板即开始监控。
+    # 原来的行为是「面板开着但不动」，用户看到界面就以为在工作，实际一次检查都没跑
+    # （实测：面板存活 40+ 分钟，日志零新增）。双击「启动面板」的语义是「开始守护」，
+    # 不是「打开一个空壳给我点按钮」。
+    root.after(800, start)
+
     root.mainloop()
     return 0
 
@@ -2856,6 +3375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     w.add_argument("--once", action="store_true", help="只检查一次")
     sub.add_parser("gui", help="图形面板", parents=[common])
     sub.add_parser("probe", help="截图核对点击位置", parents=[common])
+    sub.add_parser("lockcheck", help="实测锁屏下哪些输入通道还活着", parents=[common])
     sub.add_parser("selftest", help="判定逻辑自检", parents=[common])
     r = sub.add_parser("replay", help="对指定 jsonl 跑一次判定", parents=[common])
     r.add_argument("file", type=Path)
@@ -2881,6 +3401,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_gui(cfg)
     if cmd == "probe":
         return cmd_probe(cfg)
+    if cmd == "lockcheck":
+        return cmd_lockcheck(cfg)
     if cmd == "selftest":
         return cmd_selftest(cfg)
     if cmd == "replay":

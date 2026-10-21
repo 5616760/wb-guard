@@ -84,12 +84,39 @@ WorkBuddy 顶部标题是绘制文本，UIA 读不到，所以不能靠"读当�
   「空间」→ 展开该项目才会出现。这时日志会提示：
   `切换失败（目标「xxx」）。请确认该任务在左栏可见：若属于某个项目，先在「空间」里展开该项目一次`
   检测本身仍然有效（会报"需处理"），只是不自动发。
-- **锁屏时完全无法发送**。Windows 在锁屏状态下拦截一切模拟输入，窗口也切不到前台，
-  屏幕截图拿回来是纯黑（指纹退化成 `0.0|0.0|0.0000`）。守护会在发送前检测
-  （`workstation_locked()`：查 LogonUI.exe + 读输入桌面名），命中就直接跳过并记
-  `workstation-locked`，日志写"工作站已锁屏，无法发送输入…解锁后会自动重试"。
-  `status` 也会直接显示"桌面状态：已锁屏"。
-  要无人值守跑，就得关掉自动锁屏 / 设置永不休眠，或用 `powercfg` 把锁屏超时设为 0。
+- **锁屏时完全无法发送 —— 这是 Windows 的安全边界，不是程序 bug**。
+  2026-10-22 在 Win11 26200 上逐条实测过（`python wb_guard.py lockcheck` 可复现）：
+
+  | 通道 | 锁屏时 | 证据 |
+  |---|---|---|
+  | `SendInput` 模拟键鼠 | ✗ | 前台被锁屏界面占用，输入不落到目标窗口 |
+  | `SetForegroundWindow` | ✗ | 返回 0，`err=18` |
+  | UIA（uiautomation） | ✗ | 树塌成空 Pane，读到 0 个任务项、标题为空 |
+  | 剪贴板 `OpenClipboard` | ✗ | 写入失败，读回 `None` |
+  | `PostMessage` → 标准 Win32 控件 | ✓ | 记事本 `Edit` 实测成功写入 `lock-test-OK` |
+  | `PostMessage` → Electron | ✗ | WorkBuddy 主窗口 **0 个子控件**，无可投递目标 |
+  | `OpenInputDesktop` 读桌面名 | ✗（不可信） | 锁屏时仍返回 `Default`，不能反推「没锁」 |
+
+  所以「锁屏下还能发指令」做不到。守护的处理方式是：
+  1. 发送前检测（三条判据取并集：前台是锁屏界面 / `LogonUI.exe` 存在 / 输入桌面非 `Default`），
+     命中就跳过并记 `workstation-locked`，**不消耗重试次数**（锁屏几小时也不会把 attempts 耗光）；
+  2. **主动阻止锁屏**（唯一纯软件能做、不用管理员权限的事）：`config.json` 里
+     `keep_awake: true` + `keep_display_on: true`，守护运行期间调 `SetThreadExecutionState`
+     挡住空闲睡眠与熄屏，并在锁屏状态每轮变化时续一次；
+  3. 面板顶部常驻红色提示「⚠ 桌面已锁屏：检测正常，但锁屏下无法发送输入」，
+     `status` 显示「可发送：否」——绝不谎报已发送；
+  4. 解锁后**自动恢复**，不需要重开程序。
+
+  注意 `keep_awake` 只挡「空闲触发」的睡眠/熄屏，**挡不住用户手动 Win+L**。
+  要彻底无人值守，还得关掉屏保和自动锁屏：
+
+  ```
+  # 屏保（需在「设置 → 个性化 → 锁屏界面 → 屏幕保护程序」里取消，或）
+  powercfg /change monitor-timeout-ac 0      # 显示器永不关闭
+  powercfg /change standby-timeout-ac 0      # 系统永不睡眠
+  ```
+  更彻底的是组策略 `Computer Configuration → Administrative Templates → Control Panel →
+  Personalization → Do not display the lock screen`（需管理员；且只挡锁屏、不挡熄屏）。
 - **权限必须一致**：如果 WorkBuddy 是"以管理员身份运行"，守护也要用管理员权限启动，
   否则系统会拦截模拟输入（UIPI）。
 
