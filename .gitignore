@@ -1,0 +1,22 @@
+# ---- 运行产物（不入库）----
+logs/
+state.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+envs/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地覆盖配置（放个人路径、密钥等）----
+config.local.json
