@@ -30,13 +30,17 @@ jobs:
 
       - name: Build exe
         run: |
-          python -m PyInstaller --noconfirm --onefile --console --name wb-guard `
+          python -m PyInstaller --noconfirm --onefile --windowed --name wb-guard `
             --hidden-import tkinter --hidden-import tkinter.ttk wb_launcher.py
         shell: pwsh
 
-      - name: Verify exe runs
+      - name: Verify exe is GUI subsystem
         run: |
-          .\dist\wb-guard.exe --help
+          $bytes = [System.IO.File]::ReadAllBytes("dist\wb-guard.exe")
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $peOff + 24 + 68)
+          Write-Host "Subsystem = $subsystem (2 = WINDOWS_GUI, 无控制台)"
+          if ($subsystem -ne 2) { throw "打包结果不是 GUI 子系统，双击会弹黑窗" }
         shell: pwsh
 
       - name: Upload artifact

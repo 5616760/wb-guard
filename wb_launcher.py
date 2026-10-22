@@ -41,7 +41,9 @@ else:
 try:
     import wb_guard
 except ImportError as _e:  # pragma: no cover
-    sys.stderr.write(f"[FATAL] 无法导入 wb_guard：{_e}\n")
+    # windowed 打包下 stderr 可能为 None，不能直接 write
+    if sys.stderr is not None:
+        sys.stderr.write(f"[FATAL] 无法导入 wb_guard：{_e}\n")
     raise
 
 BANNER = "=" * 60
@@ -343,17 +345,21 @@ def cmd_autostart(enable: bool) -> int:
     return code
 
 
-def print_usage(stream=sys.stdout) -> None:
+def print_usage(stream=None) -> None:
+    # 默认值不能写成 stream=sys.stdout：windowed 打包下导入时它是 None，
+    # 默认参数会被永久固化成 None。改为调用时取。
+    if stream is None:
+        stream = sys.stdout
     print(
         """wb-guard 断流守护
 用法：
-  wb-guard.exe                 打开面板（默认，等价于原「启动面板」）
-  wb-guard.exe panel           同上
-  wb-guard.exe watch           控制台监控，自动发「继续」
+  wb-guard.exe                打开面板（默认，等价于原「启动面板」）
+  wb-guard.exe panel          同上
+  wb-guard.exe watch          控制台监控，自动发「继续」
   wb-guard.exe watch --dry-run 只观察，不发消息
-  wb-guard.exe stop            停止守护
-  wb-guard.exe autostart on    安装开机自启
-  wb-guard.exe autostart off   取消开机自启
+  wb-guard.exe stop           停止守护
+  wb-guard.exe autostart on   安装开机自启
+  wb-guard.exe autostart off  取消开机自启
 
 其他高级命令直接透传给 wb_guard.py：
   status / probe / lockcheck / selftest / replay / test-input
@@ -363,7 +369,23 @@ def print_usage(stream=sys.stdout) -> None:
 
 
 def _init_console() -> None:
-    """对齐 bat 里的 chcp 65001：把控制台切到 UTF-8，否则 exe 输出中文是乱码。"""
+    """确保有可用的输出流，并把控制台切到 UTF-8。
+
+    windowed（无控制台）打包下 sys.stdout / sys.stderr 为 None，
+    print() 会直接抛 AttributeError。这里兜底重定向到空设备，
+    保证 CLI 子命令不会因为「没有窗口」而崩溃。
+    """
+    if sys.stdout is None:
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr is None:
+        try:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     if os.name != "nt":
         return
     try:
@@ -383,6 +405,36 @@ def _init_console() -> None:
 def main(argv: list[str] | None = None) -> int:
     _init_console()
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    # windowed 打包没有控制台，未捕获异常会静默消失、看起来像「双击没反应」。
+    # 这里兜底写进日志，并在 GUI 模式弹窗提示，保证故障可诊断。
+    def _fatal(exc_type, exc_val, exc_tb):
+        import traceback
+
+        msg = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+        try:
+            wb_guard.log("未捕获异常：\n" + msg, "ERROR")
+        except Exception:
+            try:
+                err_file = BASE_DIR / "logs" / "launcher-crash.log"
+                err_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(err_file, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror("wb-guard 启动失败", msg[-1500:])
+            r.destroy()
+        except Exception:
+            pass
+
+    sys.excepthook = _fatal
+
     if argv and argv[0] in ("-h", "--help", "help", "/?"):
         print_usage()
         _pause()

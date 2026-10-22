@@ -137,33 +137,35 @@ WorkBuddy 顶部标题是绘制文本，UIA 读不到，所以不能靠"读当�
 
 ## 四、快速开始
 
-**推荐：直接用 `wb-guard.exe`（单文件，替代原来的 6 个 .bat）**
+**双击 `wb-guard.exe` 即可**——直接弹出图形面板，不出现命令行窗口。
 
-双击 `wb-guard.exe` 就是图形面板（等价于原「启动面板」）。也可以带参数调用：
+日常操作全在面板上，不需要敲命令：
+
+| 面板上的操作 | 作用 |
+|---|---|
+| 「开始监控」 | 开始自动检测中断并续跑（等价于 `watch`） |
+| 「只观察不发送」勾选框 | 只报告不发送（等价于 `watch --dry-run`） |
+| 「立即检查」 | 只跑一次判定，不常驻 |
+| 「停止」 | 停止监控 |
+| 「开机自启」勾选框 | 勾上写入 HKCU 启动项，取消则删除 |
+| 「立即续跑选中任务」 | 对表格里选中的任务立刻发「继续」 |
+| 「打开日志」 | 用记事本打开 `logs/wb_guard.log` |
+
+> 配置 `config.json`、日志 `logs/`、状态 `state.json` 都在 exe 同目录。
+> 放到别处也能运行，但会生成一份默认配置；想沿用现有配置就放在本目录。
+
+命令行入口仍然保留（给自动化/排障用）：
 
 ```bash
 wb-guard.exe                 # 打开面板（默认）
-wb-guard.exe watch           # 控制台监控，自动发「继续」
-wb-guard.exe watch --dry-run # 只观察，不发送
-wb-guard.exe stop            # 停止守护
-wb-guard.exe autostart on    # 安装开机自启
+wb-guard.exe watch           # 无界面常驻监控
+wb-guard.exe watch --dry-run # 无界面只观察
+wb-guard.exe stop            # 停止所有守护进程
+wb-guard.exe autostart on    # 开机自启（等价于勾面板）
 wb-guard.exe autostart off   # 取消开机自启
 ```
 
-> `config.json`、`logs/`、`state.json` 都跟 exe 放在同一目录。
-> 把 exe 放到别处也能跑，但会自动生成一份默认 `config.json`——想沿用现有配置，就放在本目录。
-
-原来的 6 个 `.bat` 已归档到 `legacy-bat/`，功能完全被 exe 覆盖，不再需要。
-
-第一次跑建议先观察，不真发：
-
-```bash
-wb-guard.exe status              # 看一眼所有任务现在什么状态
-wb-guard.exe watch --dry-run     # 常驻观察，只报告不发送
-wb-guard.exe watch               # 正式启用
-```
-
-开机自启：`wb-guard.exe autostart on`（写 HKCU\...\Run，静默后台跑，不弹窗）。
+原来的 6 个 `.bat` 已归档到 `legacy-bat/`，功能完全被 exe 覆盖。
 
 ## 五、命令
 
@@ -248,9 +250,12 @@ wb-guard.exe watch               # 正式启用
 打包命令（需先 `pip install pyinstaller`）：
 
 ```bash
-python -m PyInstaller --noconfirm --onefile --console --name wb-guard ^
+python -m PyInstaller --noconfirm --onefile --windowed --name wb-guard ^
   --hidden-import tkinter --hidden-import tkinter.ttk wb_launcher.py
 ```
+
+`--windowed` 生成 GUI 子系统程序（Subsystem=2），双击不弹黑窗；
+不要误用 `--console`，那会带出一个命令行窗口。
 
 产物在 `dist/wb-guard.exe`，复制到本目录即可使用。
 

@@ -3070,6 +3070,23 @@ def _autostart_command() -> str:
     return f'"{runner}" "{Path(__file__).resolve()}" watch'
 
 
+def _autostart_enabled() -> bool:
+    """读注册表判断当前是否已设置开机自启（供面板勾选框初始化）。"""
+    import winreg
+
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return True
+        finally:
+            winreg.CloseKey(key)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
 def cmd_autostart(enable: bool) -> int:
     import winreg
 
@@ -3172,6 +3189,23 @@ def cmd_gui(cfg: Dict[str, Any]) -> int:
     ttk.Label(opts, text="卡死阈值(秒)").pack(side="left")
     ttk.Entry(opts, textvariable=stall_var, width=7).pack(side="left", padx=(6, 14))
     ttk.Checkbutton(opts, text="只观察不发送", variable=dry_var).pack(side="left")
+
+    # 开机自启开关：直接读写 HKCU Run，等价于原来的「开机自启-安装/取消.bat」
+    autostart_var = tk.BooleanVar(value=_autostart_enabled())
+
+    def _toggle_autostart():
+        """勾/取消勾选即写入或删除注册表项，失败则回滚界面状态。"""
+        want = bool(autostart_var.get())
+        try:
+            cmd_autostart(want)
+            push("已设为开机自启" if want else "已取消开机自启")
+        except Exception as e:
+            autostart_var.set(not want)
+            push(f"开机自启设置失败：{e}")
+
+    ttk.Checkbutton(
+        opts, text="开机自启", variable=autostart_var, command=_toggle_autostart
+    ).pack(side="left", padx=(18, 0))
 
     btns = ttk.Frame(root, padding=10)
     btns.pack(fill="x")
