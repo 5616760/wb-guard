@@ -59,7 +59,12 @@ HOME = Path(os.path.expanduser("~"))
 WB_HOME = HOME / ".workbuddy"
 PROJECTS_DIR = WB_HOME / "projects"
 
-HERE = Path(__file__).resolve().parent
+# PyInstaller 打包后 __file__ 指向临时解包目录（_MEIPASS，进程退出即删），
+# 配置/状态/日志必须落在 exe 所在目录，否则重启就丢。frozen 时优先用 exe 路径。
+if getattr(sys, "frozen", False):
+    HERE = Path(sys.executable).resolve().parent
+else:
+    HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 STATE_PATH = HERE / "state.json"
 LOG_DIR = HERE / "logs"
@@ -3056,6 +3061,9 @@ AUTOSTART_NAME = "WorkBuddyGuard"
 
 
 def _autostart_command() -> str:
+    if getattr(sys, "frozen", False):
+        # 打包成 exe：直接让 exe 自己以 watch 模式自启，不需要 python 解释器。
+        return f'"{Path(sys.executable).resolve()}" watch'
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
     runner = pyw if pyw.exists() else exe

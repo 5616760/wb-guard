@@ -1,0 +1,55 @@
+name: Build and Release
+
+# 打 tag（如 v3.5、v1.0.0）时自动打包 wb-guard.exe 并发布 Release。
+# 也可以手动在 Actions 页面点 Run workflow 触发（仅产出 artifact，不发 Release）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build exe
+        run: |
+          python -m PyInstaller --noconfirm --onefile --console --name wb-guard `
+            --hidden-import tkinter --hidden-import tkinter.ttk wb_launcher.py
+        shell: pwsh
+
+      - name: Verify exe runs
+        run: |
+          .\dist\wb-guard.exe --help
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb-guard-exe
+          path: dist/wb-guard.exe
+          if-no-files-found: error
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/wb-guard.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

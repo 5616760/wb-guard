@@ -1,6 +1,14 @@
 # ---- 运行产物（不入库）----
 logs/
 state.json
+wb-guard.pid
+
+# ---- 构建产物（PyInstaller）----
+build/
+*.spec
+
+# exe 不入库：用 tag 触发 GitHub Actions 自动打包并发 Release
+dist/
 
 # ---- Python ----
 __pycache__/

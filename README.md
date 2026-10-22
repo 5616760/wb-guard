@@ -137,17 +137,33 @@ WorkBuddy 顶部标题是绘制文本，UIA 读不到，所以不能靠"读当�
 
 ## 四、快速开始
 
-双击 **`启动监控.bat`**（控制台看日志），或双击 **`启动面板.bat`**（图形面板，可勾"只观察不发送"）。
+**推荐：直接用 `wb-guard.exe`（单文件，替代原来的 6 个 .bat）**
+
+双击 `wb-guard.exe` 就是图形面板（等价于原「启动面板」）。也可以带参数调用：
+
+```bash
+wb-guard.exe                 # 打开面板（默认）
+wb-guard.exe watch           # 控制台监控，自动发「继续」
+wb-guard.exe watch --dry-run # 只观察，不发送
+wb-guard.exe stop            # 停止守护
+wb-guard.exe autostart on    # 安装开机自启
+wb-guard.exe autostart off   # 取消开机自启
+```
+
+> `config.json`、`logs/`、`state.json` 都跟 exe 放在同一目录。
+> 把 exe 放到别处也能跑，但会自动生成一份默认 `config.json`——想沿用现有配置，就放在本目录。
+
+原来的 6 个 `.bat` 已归档到 `legacy-bat/`，功能完全被 exe 覆盖，不再需要。
 
 第一次跑建议先观察，不真发：
 
 ```bash
-python wb_guard.py status              # 看一眼所有任务现在什么状态
-python wb_guard.py watch --dry-run     # 常驻观察，只报告不发送
-python wb_guard.py watch               # 正式启用
+wb-guard.exe status              # 看一眼所有任务现在什么状态
+wb-guard.exe watch --dry-run     # 常驻观察，只报告不发送
+wb-guard.exe watch               # 正式启用
 ```
 
-开机自启：双击 `开机自启-安装.bat`（写 HKCU\...\Run，静默后台跑，不弹窗）。
+开机自启：`wb-guard.exe autostart on`（写 HKCU\...\Run，静默后台跑，不弹窗）。
 
 ## 五、命令
 
@@ -157,12 +173,13 @@ python wb_guard.py watch               # 正式启用
 | `watch` | 常驻监控（默认动作） |
 | `watch --once` | 只检查一次，需要时立刻处理 |
 | `watch --dry-run` | 只报告，不发送 |
-| `gui` | 图形面板（含任务状态表格 + 手动续跑按钮） |
+| `panel` / `gui` | 图形面板（含任务状态表格 + 手动续跑按钮） |
+| `stop` | 停止所有守护进程（含 onefile 的引导进程） |
+| `autostart on\|off` | 开机自启开关 |
 | `probe` | 截一张窗口图，红点标出"续跑时会点哪里"，用来核对位置 |
 | `replay <文件>` | 对指定 jsonl 跑一次判定（离线复盘） |
 | `selftest` | 判定逻辑自检（12 个合成用例） |
 | `test-input` | 输入通道自检（往记事本粘贴，不碰 WorkBuddy） |
-| `install-autostart` / `remove-autostart` | 开机自启开关 |
 
 ## 六、配置（config.json）
 
@@ -221,7 +238,30 @@ python wb_guard.py watch               # 正式启用
 - 输入通道：记事本实测，文字确实粘贴进去并回车换行（`test-input` + 截图）。
 - 位置探针：`probe` 红点落在 WorkBuddy 输入框内（单栏、右侧开文档面板两种版式均核对）。
 
-## 九、排错
+## 九、打包（重新生成 wb-guard.exe）
+
+源码由两部分组成：
+
+- `wb_guard.py` —— 核心逻辑（判定、续跑、GUI）。
+- `wb_launcher.py` —— 单文件启动器，把原来 6 个 bat 的子命令收进一个 exe。
+
+打包命令（需先 `pip install pyinstaller`）：
+
+```bash
+python -m PyInstaller --noconfirm --onefile --console --name wb-guard ^
+  --hidden-import tkinter --hidden-import tkinter.ttk wb_launcher.py
+```
+
+产物在 `dist/wb-guard.exe`，复制到本目录即可使用。
+
+注意两点（都已在内置逻辑里处理，改代码时别破坏）：
+
+1. `wb_guard.py` 用 `sys.frozen` 判断运行环境，打包后配置/日志走 exe 所在目录，
+   不落到 `_MEIPASS` 临时目录（否则每次重启都丢配置）。
+2. 启动器用 **import 调用** `wb_guard.main()`，不起子进程——onefile 的
+   `sys.executable` 指向 exe 自身，子进程调用会死循环。
+
+## 十、排错
 
 | 现象 | 处理 |
 |---|---|
@@ -231,7 +271,8 @@ python wb_guard.py watch               # 正式启用
 | 救完别的任务后人被拽到那个对话了 | 正常，发完会自动切回（`switch_back_after_recover`）。若没切回，说明原任务也不在左栏可见列表里 |
 | 老是误判"卡死" | 调大 `stall_timeout` / `tool_stall_timeout`；或先用 `--dry-run` 观察一段时间再定阈值 |
 | 一直判定 interrupted 但界面看起来正常 | 可能是历史残留记录，`status` 看"距上次事件"；必要时 `replay` 该文件确认 |
-| 面板打不开 | 用 `启动监控.bat` 走控制台，看报错 |
+| 面板打不开 | 改用 `wb-guard.exe watch` 走控制台，看报错 |
+| 停不掉守护 | `wb-guard.exe stop`；若仍残留，任务管理器结束 `wb-guard.exe` 即可 |
 | 想立刻救某个任务 | 面板里选中那一行，点「立即续跑选中任务」（忽略冷却立即执行） |
 
 日志：`logs/wb_guard.log`（超 2MB 自动轮转）；状态：`state.json`；截图：`logs/*.png`。
